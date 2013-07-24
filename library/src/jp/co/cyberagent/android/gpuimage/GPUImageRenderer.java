@@ -16,17 +16,6 @@
 
 package jp.co.cyberagent.android.gpuimage;
 
-import java.io.IOException;
-import java.nio.ByteBuffer;
-import java.nio.ByteOrder;
-import java.nio.FloatBuffer;
-import java.nio.IntBuffer;
-import java.util.LinkedList;
-import java.util.Queue;
-
-import javax.microedition.khronos.egl.EGLConfig;
-import javax.microedition.khronos.opengles.GL10;
-
 import android.annotation.TargetApi;
 import android.graphics.Bitmap;
 import android.graphics.Canvas;
@@ -37,43 +26,33 @@ import android.hardware.Camera.Size;
 import android.opengl.GLES20;
 import android.opengl.GLSurfaceView.Renderer;
 
+import jp.co.cyberagent.android.gpuimage.util.TextureRotationUtil;
+
+import javax.microedition.khronos.egl.EGLConfig;
+import javax.microedition.khronos.opengles.GL10;
+import java.io.IOException;
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
+import java.nio.FloatBuffer;
+import java.nio.IntBuffer;
+import java.util.LinkedList;
+import java.util.Queue;
+
+import static jp.co.cyberagent.android.gpuimage.util.TextureRotationUtil.TEXTURE_NO_ROTATION;
+
 @TargetApi(11)
 public class GPUImageRenderer implements Renderer, PreviewCallback {
     public static final int NO_IMAGE = -1;
     static final float CUBE[] = {
-            -1.0f, 1.0f,
-            1.0f, 1.0f,
             -1.0f, -1.0f,
             1.0f, -1.0f,
-    };
-
-    static final float TEXTURE_NO_ROTATION[] = {
-            0.0f, 1.0f,
-            1.0f, 1.0f,
-            0.0f, 0.0f,
-            1.0f, 0.0f,
-    };
-
-    private static final float TEXTURE_ROTATED_90[] = {
-            1.0f, 1.0f,
-            1.0f, 0.0f,
-            0.0f, 1.0f,
-            0.0f, 0.0f,
-    };
-    private static final float TEXTURE_ROTATED_180[] = {
-            1.0f, 0.0f,
-            0.0f, 0.0f,
-            1.0f, 1.0f,
-            0.0f, 1.0f,
-    };
-    private static final float TEXTURE_ROTATED_270[] = {
-            0.0f, 0.0f,
-            0.0f, 1.0f,
-            1.0f, 0.0f,
+            -1.0f, 1.0f,
             1.0f, 1.0f,
     };
 
     private GPUImageFilter mFilter;
+
+    public final Object mSurfaceChangedWaiter = new Object();
 
     private int mGLTextureId = NO_IMAGE;
     private SurfaceTexture mSurfaceTexture = null;
@@ -88,13 +67,16 @@ public class GPUImageRenderer implements Renderer, PreviewCallback {
     private int mAddedPadding;
 
     private final Queue<Runnable> mRunOnDraw;
+    private final Queue<Runnable> mRunOnDrawEnd;
     private Rotation mRotation;
     private boolean mFlipHorizontal;
     private boolean mFlipVertical;
+    private GPUImage.ScaleType mScaleType = GPUImage.ScaleType.CENTER_CROP;
 
     public GPUImageRenderer(final GPUImageFilter filter) {
         mFilter = filter;
         mRunOnDraw = new LinkedList<Runnable>();
+        mRunOnDrawEnd = new LinkedList<Runnable>();
 
         mGLCubeBuffer = ByteBuffer.allocateDirect(CUBE.length * 4)
                 .order(ByteOrder.nativeOrder())
@@ -111,7 +93,7 @@ public class GPUImageRenderer implements Renderer, PreviewCallback {
     public void onSurfaceCreated(final GL10 unused, final EGLConfig config) {
         GLES20.glClearColor(0, 0, 0, 1);
         GLES20.glDisable(GLES20.GL_DEPTH_TEST);
-        mFilter.onInit();
+        mFilter.init();
     }
 
     @Override
@@ -121,19 +103,28 @@ public class GPUImageRenderer implements Renderer, PreviewCallback {
         GLES20.glViewport(0, 0, width, height);
         GLES20.glUseProgram(mFilter.getProgram());
         mFilter.onOutputSizeChanged(width, height);
+        adjustImageScaling();
+        synchronized (mSurfaceChangedWaiter) {
+            mSurfaceChangedWaiter.notifyAll();
+        }
     }
 
     @Override
     public void onDrawFrame(final GL10 gl) {
         GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT | GLES20.GL_DEPTH_BUFFER_BIT);
-        synchronized (mRunOnDraw) {
-            while (!mRunOnDraw.isEmpty()) {
-                mRunOnDraw.poll().run();
-            }
-        }
+        runAll(mRunOnDraw);
         mFilter.onDraw(mGLTextureId, mGLCubeBuffer, mGLTextureBuffer);
-        if (false || mSurfaceTexture != null) {
+        runAll(mRunOnDrawEnd);
+        if (mSurfaceTexture != null) {
             mSurfaceTexture.updateTexImage();
+        }
+    }
+
+    private void runAll(Queue<Runnable> queue) {
+        synchronized (queue) {
+            while (!queue.isEmpty()) {
+                queue.poll().run();
+            }
         }
     }
 
@@ -188,9 +179,9 @@ public class GPUImageRenderer implements Renderer, PreviewCallback {
                 final GPUImageFilter oldFilter = mFilter;
                 mFilter = filter;
                 if (oldFilter != null) {
-                    oldFilter.onDestroy();
+                    oldFilter.destroy();
                 }
-                mFilter.onInit();
+                mFilter.init();
                 GLES20.glUseProgram(mFilter.getProgram());
                 mFilter.onOutputSizeChanged(mOutputWidth, mOutputHeight);
             }
@@ -202,7 +193,7 @@ public class GPUImageRenderer implements Renderer, PreviewCallback {
 
             @Override
             public void run() {
-                GLES20.glDeleteTextures(1, new int[] {
+                GLES20.glDeleteTextures(1, new int[]{
                         mGLTextureId
                 }, 0);
                 mGLTextureId = NO_IMAGE;
@@ -215,6 +206,10 @@ public class GPUImageRenderer implements Renderer, PreviewCallback {
     }
 
     public void setImageBitmap(final Bitmap bitmap, final boolean recycle) {
+        if (bitmap == null) {
+            return;
+        }
+
         runOnDraw(new Runnable() {
 
             @Override
@@ -243,6 +238,10 @@ public class GPUImageRenderer implements Renderer, PreviewCallback {
         });
     }
 
+    public void setScaleType(GPUImage.ScaleType scaleType) {
+        mScaleType = scaleType;
+    }
+
     protected int getFrameWidth() {
         return mOutputWidth;
     }
@@ -261,75 +260,58 @@ public class GPUImageRenderer implements Renderer, PreviewCallback {
 
         float ratio1 = outputWidth / mImageWidth;
         float ratio2 = outputHeight / mImageHeight;
-        float ratioMin = Math.min(ratio1, ratio2);
-        mImageWidth = Math.round(mImageWidth * ratioMin);
-        mImageHeight = Math.round(mImageHeight * ratioMin);
+        float ratioMax = Math.max(ratio1, ratio2);
+        int imageWidthNew = Math.round(mImageWidth * ratioMax);
+        int imageHeightNew = Math.round(mImageHeight * ratioMax);
 
-        float ratioWidth = 1.0f;
-        float ratioHeight = 1.0f;
-        if (mImageWidth != outputWidth) {
-            ratioWidth = mImageWidth / outputWidth;
-        } else if (mImageHeight != outputHeight) {
-            ratioHeight = mImageHeight / outputHeight;
+        float ratioWidth = imageWidthNew / outputWidth;
+        float ratioHeight = imageHeightNew / outputHeight;
+
+        float[] cube = CUBE;
+        float[] textureCords = TextureRotationUtil.getRotation(mRotation, mFlipHorizontal, mFlipVertical);
+        if (mScaleType == GPUImage.ScaleType.CENTER_CROP) {
+            float distHorizontal = (1 - 1 / ratioWidth) / 2;
+            float distVertical = (1 - 1 / ratioHeight) / 2;
+            textureCords = new float[]{
+                    addDistance(textureCords[0], distHorizontal), addDistance(textureCords[1], distVertical),
+                    addDistance(textureCords[2], distHorizontal), addDistance(textureCords[3], distVertical),
+                    addDistance(textureCords[4], distHorizontal), addDistance(textureCords[5], distVertical),
+                    addDistance(textureCords[6], distHorizontal), addDistance(textureCords[7], distVertical),
+            };
+        } else {
+            cube = new float[]{
+                    CUBE[0] / ratioHeight, CUBE[1] / ratioWidth,
+                    CUBE[2] / ratioHeight, CUBE[3] / ratioWidth,
+                    CUBE[4] / ratioHeight, CUBE[5] / ratioWidth,
+                    CUBE[6] / ratioHeight, CUBE[7] / ratioWidth,
+            };
         }
 
-        // for some reason we need to do minus on the right side. Otherwise it
-        // is always flipped vertically
-        float cube[] = {
-                CUBE[0] * ratioWidth, -CUBE[1] * ratioHeight,
-                CUBE[2] * ratioWidth, -CUBE[3] * ratioHeight,
-                CUBE[4] * ratioWidth, -CUBE[5] * ratioHeight,
-                CUBE[6] * ratioWidth, -CUBE[7] * ratioHeight,
-        };
         mGLCubeBuffer.clear();
         mGLCubeBuffer.put(cube).position(0);
+        mGLTextureBuffer.clear();
+        mGLTextureBuffer.put(textureCords).position(0);
     }
 
-    public enum Rotation {
-        NORMAL, ROTATION_90, ROTATION_180, ROTATION_270
+    private float addDistance(float coordinate, float distance) {
+        return coordinate == 0.0f ? distance : 1 - distance;
     }
 
-    public void setRotation(final Rotation rotation, final boolean flipHorizontal,
+    public void setRotationCamera(final Rotation rotation, final boolean flipHorizontal,
             final boolean flipVertical) {
+        setRotation(rotation, flipVertical, flipHorizontal);
+    }
+
+    public void setRotation(final Rotation rotation) {
         mRotation = rotation;
+        adjustImageScaling();
+    }
+
+    public void setRotation(final Rotation rotation,
+                            final boolean flipHorizontal, final boolean flipVertical) {
         mFlipHorizontal = flipHorizontal;
         mFlipVertical = flipVertical;
-
-        float[] rotatedTex = null;
-        switch (rotation) {
-            case ROTATION_90:
-                rotatedTex = TEXTURE_ROTATED_90;
-                break;
-            case ROTATION_180:
-                rotatedTex = TEXTURE_ROTATED_180;
-                break;
-            case ROTATION_270:
-                rotatedTex = TEXTURE_ROTATED_270;
-                break;
-            case NORMAL:
-            default:
-                rotatedTex = TEXTURE_NO_ROTATION;
-                break;
-        }
-        if (flipHorizontal) {
-            rotatedTex = new float[] {
-                    rotatedTex[0], flip(rotatedTex[1]),
-                    rotatedTex[2], flip(rotatedTex[3]),
-                    rotatedTex[4], flip(rotatedTex[5]),
-                    rotatedTex[6], flip(rotatedTex[7]),
-            };
-        }
-        if (flipVertical) {
-            rotatedTex = new float[] {
-                    flip(rotatedTex[0]), rotatedTex[1],
-                    flip(rotatedTex[2]), rotatedTex[3],
-                    flip(rotatedTex[4]), rotatedTex[5],
-                    flip(rotatedTex[6]), rotatedTex[7],
-            };
-        }
-
-        mGLTextureBuffer.clear();
-        mGLTextureBuffer.put(rotatedTex).position(0);
+        setRotation(rotation);
     }
 
     public Rotation getRotation() {
@@ -344,16 +326,15 @@ public class GPUImageRenderer implements Renderer, PreviewCallback {
         return mFlipVertical;
     }
 
-    private float flip(final float i) {
-        if (i == 0.0f) {
-            return 1.0f;
-        }
-        return 0.0f;
-    }
-
     protected void runOnDraw(final Runnable runnable) {
         synchronized (mRunOnDraw) {
             mRunOnDraw.add(runnable);
+        }
+    }
+
+    protected void runOnDrawEnd(final Runnable runnable) {
+        synchronized (mRunOnDrawEnd) {
+            mRunOnDrawEnd.add(runnable);
         }
     }
 }
